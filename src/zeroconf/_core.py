@@ -269,7 +269,7 @@ class Zeroconf(QuietLogger):
         while probes_sent < _REGISTER_BROADCASTS:
             # check for a name conflict; a cache update during the wait below
             # wakes async_wait, so a conflicting response lands here promptly
-            if self.cache.current_entry_with_name_and_alias(info.type, info.name):
+            if self._has_probe_conflict(info):
                 if not allow_name_change:
                     raise NonUniqueNameException
 
@@ -757,6 +757,23 @@ class Zeroconf(QuietLogger):
             return
         self.remove_all_service_listeners()
         self.done = True
+
+    def _has_probe_conflict(self, info: ServiceInfo) -> bool:
+        """Whether a cached peer claims the probed name with different records.
+
+        RFC 6762 §9.2: a peer holding records identical to the ones being
+        probed is not a conflict — simultaneous responders may keep the
+        shared name. Only an existing claim whose SRV/TXT/address records
+        differ from ours forces a rename or failure.
+        """
+        if not self.cache.current_entry_with_name_and_alias(info.type, info.name):
+            return False
+        own_records = (
+            info.dns_service(),
+            info.dns_text(),
+            *info.get_address_and_nsec_records(),
+        )
+        return any(self.cache.async_get_unique(record) is None for record in own_records)
 
     def _shutdown_threads(self) -> None:
         """Shutdown any threads."""
