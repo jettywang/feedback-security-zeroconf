@@ -132,17 +132,28 @@ class DNSCache:
         return expired
 
     def async_get_address(self, entry: DNSAddress) -> DNSAddress | None:
-        """Look up the cached copy of an address record under any scope, or None."""
+        """Look up the cached copy of an address record under a compatible scope, or None.
+
+        A cached record is compatible when both scope_ids are equal or
+        either side carries no scope. The same link-local address learned
+        on two different interfaces (different scope_ids) is not a match,
+        so each interface keeps its own record.
+        """
         store = self.cache.get(entry.key)
         if store is None:
             return None
+        # A scope_id of 0 means the receiving socket reported no scope.
+        entry_scope_id = entry.scope_id or None
         for record in store.values():
-            if (
+            if not (
                 isinstance(record, DNSAddress)
                 and record.address == entry.address
                 and record.type == entry.type
                 and record.class_ == entry.class_
             ):
+                continue
+            record_scope_id = record.scope_id or None
+            if entry_scope_id is None or record_scope_id is None or record_scope_id == entry_scope_id:
                 return record
         return None
 

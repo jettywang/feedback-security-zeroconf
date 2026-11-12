@@ -99,17 +99,33 @@ def _index_of_same_address(
     addresses: Sequence[ZeroconfIPv4Address | ZeroconfIPv6Address],
     ip_addr: ZeroconfIPv4Address | ZeroconfIPv6Address,
 ) -> int:
-    """Return the index of an existing entry with the same packed bytes, or -1.
+    """Return the index of an existing entry for the same interface, or -1.
 
     Match by ``zc_integer`` so IPv6 addresses that differ only in
     scope_id (one observed without scope on an IPv4 socket, another
     observed with scope on an IPv6 socket) collapse to a single entry.
+    Entries carrying different known scope_ids were learned on different
+    interfaces and stay separate so each interface keeps its own
+    connectable address.
     """
     target = ip_addr.zc_integer
+    target_scope = _scope_id_of(ip_addr)
     for idx, existing in enumerate(addresses):
-        if existing.zc_integer == target:
+        if existing.zc_integer != target:
+            continue
+        existing_scope = _scope_id_of(existing)
+        if existing_scope is None or target_scope is None or existing_scope == target_scope:
             return idx
     return -1
+
+
+def _scope_id_of(addr: ZeroconfIPv4Address | ZeroconfIPv6Address) -> str | None:
+    """Return the address's scope_id, or None for IPv4 and unscoped addresses."""
+    if addr.version != 6:
+        return None
+    if TYPE_CHECKING:
+        assert isinstance(addr, ZeroconfIPv6Address)
+    return addr.scope_id
 
 
 def _has_more_scope_info(
@@ -467,6 +483,38 @@ class ServiceInfo(RecordUpdateListener):
         """Instance name with the service type stripped."""
         return self._name[: len(self._name) - len(self.type) - 1]
 
+    def ip_addresses_by_interface(
+        self,
+    ) -> dict[int | None, list[ZeroconfIPv4Address | ZeroconfIPv6Address]]:
+        """Group addresses by the index of the interface they were learned on.
+
+        The same link-local address discovered on multiple interfaces
+        appears once per interface, keyed by that interface's scope_id.
+        Addresses whose interface could not be determined (IPv4
+        addresses, and IPv6 addresses observed without a scope) are
+        grouped under ``None``.
+        """
+        by_interface: dict[int | None, list[ZeroconfIPv4Address | ZeroconfIPv6Address]] = {}
+        all_addresses: list[ZeroconfIPv4Address | ZeroconfIPv6Address] = [
+            *self._ipv4_addresses,
+            *self._ipv6_addresses,
+        ]
+        for addr in all_addresses:
+            key: int | None = None
+            scope_id = _scope_id_of(addr)
+            if scope_id is not None:
+                try:
+                    key = int(scope_id)
+                except ValueError:
+                    # A non-numeric zone cannot be mapped to an interface
+                    # index here; group it with the unknown interfaces.
+                    key = None
+            if key in by_interface:
+                by_interface[key].append(addr)
+            else:
+                by_interface[key] = [addr]
+        return by_interface
+
     def ip_addresses_by_version(
         self, version: IPVersion
     ) -> list[ZeroconfIPv4Address] | list[ZeroconfIPv6Address]:
@@ -785,8 +833,9 @@ class ServiceInfo(RecordUpdateListener):
                 continue
             # Records added to the cache directly, not through the
             # record manager, can hold scoped and unscoped copies of a
-            # link-local AAAA. Collapse them here so each address
-            # appears once; the scoped variant wins so callers of
+            # link-local AAAA. Collapse copies that cannot be told apart
+            # (same scope, or one side unscoped) so each interface's
+            # address appears once; the scoped variant wins so callers of
             # parsed_scoped_addresses() get a %<interface_index>-
             # qualified link-local address when one was observed.
             existing_idx = _index_of_same_address(address_list, ip_addr)
@@ -1074,7 +1123,9 @@ class ServiceInfo(RecordUpdateListener):
         scope_id) so the same link-local address received first without
         scope (IPv4 socket) and then with scope (IPv6 socket) collapses
         to one entry. The scoped variant wins so parsed_scoped_addresses()
-        can return a qualified address.
+        can return a qualified address. Addresses carrying different
+        known scope_ids arrived on different interfaces and are kept
+        as separate entries.
         """
         ipv6_addresses = self._ipv6_addresses
         existing_idx = _index_of_same_address(ipv6_addresses, ip_addr)

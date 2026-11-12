@@ -12,12 +12,13 @@ import unittest
 from collections.abc import Callable
 from ipaddress import ip_address
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import zeroconf as r
 from zeroconf import DNSAddress, RecordUpdate, const
+from zeroconf._handlers.record_manager import RecordManager
 from zeroconf._protocol.outgoing import DNSOutgoing
 from zeroconf._services import info
 from zeroconf._services.info import ServiceInfo, _has_more_scope_info
@@ -1051,6 +1052,127 @@ def test_scope_upgrade_preserves_lifo_recency_order():
         "fdc8:d776:7cca:46ed::2",
     ]
     zeroconf.close()
+
+
+def test_same_link_local_address_on_two_interfaces():
+    """The same fe80:: address announced on two interfaces stays one record per scope."""
+    zc = MagicMock()
+    zc.cache = r.DNSCache()
+    zc.record_manager = RecordManager(zc)
+    type_ = "_http._tcp.local."
+    registration_name = f"dual-nic.{type_}"
+    host = "dual-nic.local."
+    link_local = "fe80::52e:c2f2:bc5f:e9c6"
+    ula = "fdc8:d776:7cca:46ed::2"
+    unique = const._CLASS_IN | const._CLASS_UNIQUE
+
+    link_local_packed = socket.inet_pton(socket.AF_INET6, link_local)
+
+    def response_packet() -> bytes:
+        generated = DNSOutgoing(const._FLAGS_QR_RESPONSE)
+        for record in (
+            r.DNSPointer(type_, const._TYPE_PTR, unique, 120, registration_name),
+            r.DNSService(registration_name, const._TYPE_SRV, unique, 120, 0, 0, 80, host),
+            r.DNSText(registration_name, const._TYPE_TXT, unique, 120, b"\x00"),
+            r.DNSAddress(host, const._TYPE_A, unique, 120, socket.inet_aton("10.7.4.2")),
+            r.DNSAddress(host, const._TYPE_AAAA, unique, 120, link_local_packed),
+            r.DNSAddress(host, const._TYPE_AAAA, unique, 120, socket.inet_pton(socket.AF_INET6, ula)),
+        ):
+            generated.add_answer_at_time(record, 0)
+        return generated.packets()[0]
+
+    def goodbye_packet() -> bytes:
+        generated = DNSOutgoing(const._FLAGS_QR_RESPONSE)
+        generated.add_answer_at_time(r.DNSAddress(host, const._TYPE_AAAA, unique, 0, link_local_packed), 0)
+        return generated.packets()[0]
+
+    packet = response_packet()
+    now = r.current_time_millis()
+    # Both interfaces announce the same link-local address for the host
+    zc.record_manager.async_updates_from_response(r.DNSIncoming(packet, ("fe80::2", 5353), 3, now))
+    zc.record_manager.async_updates_from_response(r.DNSIncoming(packet, ("fe80::5", 5353), 5, now))
+
+    aaaa_records = zc.cache.get_all_by_details(host, const._TYPE_AAAA, const._CLASS_IN)
+    assert {record.scope_id for record in aaaa_records} == {3, 5, None}
+
+    info = ServiceInfo(type_, registration_name)
+    assert info.load_from_cache(zc)
+    assert info.parsed_scoped_addresses(r.IPVersion.V6Only) == [
+        f"{link_local}%5",
+        ula,
+        f"{link_local}%3",
+    ]
+    by_interface = info.ip_addresses_by_interface()
+    assert set(by_interface) == {None, 3, 5}
+    assert [str(addr) for addr in by_interface[3]] == [f"{link_local}%3"]
+    assert [str(addr) for addr in by_interface[5]] == [f"{link_local}%5"]
+    # IPv4 and non-link-local IPv6 addresses carry no interface information
+    assert [str(addr) for addr in by_interface[None]] == ["10.7.4.2", ula]
+
+    # A refresh from interface 3 only renews that interface's record
+    zc.record_manager.async_updates_from_response(r.DNSIncoming(packet, ("fe80::2", 5353), 3, now + 500))
+    aaaa_records = zc.cache.get_all_by_details(host, const._TYPE_AAAA, const._CLASS_IN)
+    assert len(aaaa_records) == 3
+    created_by_scope = {record.scope_id: record.created for record in aaaa_records}
+    assert created_by_scope[3] == now + 500
+    assert created_by_scope[5] == now
+    info = ServiceInfo(type_, registration_name)
+    assert info.load_from_cache(zc)
+    assert set(info.ip_addresses_by_interface()) == {None, 3, 5}
+
+    # A goodbye from interface 3 withdraws only that interface's record
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(goodbye_packet(), ("fe80::2", 5353), 3, now + 800)
+    )
+    aaaa_records = zc.cache.get_all_by_details(host, const._TYPE_AAAA, const._CLASS_IN)
+    assert {record.scope_id for record in aaaa_records} == {5, None}
+    info = ServiceInfo(type_, registration_name)
+    assert info.load_from_cache(zc)
+    assert info.parsed_scoped_addresses(r.IPVersion.V6Only) == [f"{link_local}%5", ula]
+    by_interface = info.ip_addresses_by_interface()
+    assert set(by_interface) == {None, 5}
+    assert [str(addr) for addr in by_interface[5]] == [f"{link_local}%5"]
+
+    # A goodbye without scope information still matches the scoped record
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(goodbye_packet(), ("10.7.4.9", 5353), None, now + 900)
+    )
+    aaaa_records = zc.cache.get_all_by_details(host, const._TYPE_AAAA, const._CLASS_IN)
+    assert {record.scope_id for record in aaaa_records} == {None}
+    info = ServiceInfo(type_, registration_name)
+    assert info.load_from_cache(zc)
+    assert info.parsed_scoped_addresses(r.IPVersion.V6Only) == [ula]
+
+
+def test_live_update_keeps_per_interface_scopes():
+    """Live AAAA updates carrying different scope_ids are kept as separate addresses."""
+    zc = MagicMock()
+    type_ = "_http._tcp.local."
+    registration_name = f"dual-live.{type_}"
+    host = "dual-live.local."
+    packed = socket.inet_pton(socket.AF_INET6, "fe80::52e:c2f2:bc5f:e9c6")
+    unique = const._CLASS_IN | const._CLASS_UNIQUE
+
+    info = ServiceInfo(type_, registration_name, server=host)
+    now = r.current_time_millis()
+    scope3 = r.DNSAddress(host, const._TYPE_AAAA, unique, 120, packed, scope_id=3)
+    scope5 = r.DNSAddress(host, const._TYPE_AAAA, unique, 120, packed, scope_id=5)
+
+    info.async_update_records(zc, now, [RecordUpdate(scope3, None)])
+    assert info.parsed_scoped_addresses() == ["fe80::52e:c2f2:bc5f:e9c6%3"]
+    info.async_update_records(zc, now, [RecordUpdate(scope5, None)])
+    assert info.parsed_scoped_addresses() == [
+        "fe80::52e:c2f2:bc5f:e9c6%5",
+        "fe80::52e:c2f2:bc5f:e9c6%3",
+    ]
+    assert set(info.ip_addresses_by_interface()) == {3, 5}
+
+    # Refreshing one scope moves it to the front without dropping the other
+    info.async_update_records(zc, now, [RecordUpdate(scope3, scope3)])
+    assert info.parsed_scoped_addresses() == [
+        "fe80::52e:c2f2:bc5f:e9c6%3",
+        "fe80::52e:c2f2:bc5f:e9c6%5",
+    ]
 
 
 # This test uses asyncio because it needs to access the cache directly
